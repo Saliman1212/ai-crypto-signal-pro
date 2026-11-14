@@ -1,65 +1,95 @@
 # AI Crypto Signal Pro
 
-A mobile-friendly crypto market scanner with live Binance spot data, technical indicators,
-rule-based BUY / SELL / HOLD signals, risk sizing, and optional OpenAI explanations.
+A responsive cryptocurrency market scanner that reads **public Binance spot-market candles** and calculates rule-based technical signals. It includes a single-asset analysis view and a market-wide scanner for nine liquid USDT pairs across 15-minute, 1-hour and 4-hour timeframes.
 
-## What it does
-- Scans BTC, ETH, SOL, BNB, XRP, DOGE, ADA, LINK and AVAX (USDT pairs).
-- Analyses 15m, 1h and 4h candles.
-- Calculates EMA 20/50/200, RSI(14), MACD, Bollinger Bands, ATR, volume ratio,
-  recent support/resistance and a simple trend score.
-- Produces entry zone, stop loss, take-profit levels, confidence, risk/reward and
-  position size based on the account balance and risk percentage you enter.
-- Includes an optional OpenAI explanation. The signal itself is computed from
-  market data and indicator rules, not invented by the language model.
+## Features
 
-## Important
-This is an analysis and paper-planning tool, not a guarantee of profit or financial advice.
-Crypto markets are volatile. Signals can fail, market data can be delayed, and exchange
-availability can change. Start with paper trading. This app does not place trades,
-connect to private exchange accounts, or withdraw funds.
+- Assets: BTC, ETH, SOL, BNB, XRP, DOGE, ADA, LINK and AVAX (USDT pairs).
+- Timeframes: 15m, 1h, 4h and 1d for individual asset analysis.
+- Closed-candle analysis to avoid basing signals on a still-forming candle.
+- Indicators: EMA 20/50/200, RSI(14), MACD, Bollinger Bands, ATR and relative volume.
+- Recent support/resistance, entry zone, invalidation stop, two illustrative targets and risk-based position sizing.
+- Market-wide scan: 9 assets x 3 timeframes (27 analyses), ranked by indicator agreement.
+- Optional OpenAI plain-language explanation. AI does not create or alter the signal.
+- No exchange account connection, order placement, leverage or withdrawals.
+
+## Repository layout
+
+This repository is a small single-root project:
+
+- `main.py` — FastAPI backend
+- `main.jsx` — React/Vite frontend
+- `style.css` — responsive interface
+- `index.html` — frontend entry point
+- `package.json` — frontend dependencies and scripts
+- `requirements.txt` — backend dependencies
+- `vite.config.js` — Vite configuration
 
 ## Run locally
 
-### Backend
-Requires Python 3.10+.
+### Backend (Python 3.11 recommended)
 
 ```bash
-cd backend
 python -m venv .venv
 # Windows: .venv\\Scripts\\activate
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-# Optional: add your OpenAI API key to .env for AI explanations
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+Optional backend environment variables:
+
+- `OPENAI_API_KEY` — enables optional AI explanations. Keep this secret on the backend only.
+- `OPENAI_MODEL` — optional model override; defaults to `gpt-4o-mini`.
+- `FRONTEND_ORIGINS` — comma-separated allowed frontend origins. Defaults to `http://localhost:5173`.
+- `BINANCE_BASE_URL` — optional Binance API base URL override.
+
 ### Frontend
-Requires Node.js 18+.
+
+In a second terminal, from the repository root:
 
 ```bash
-cd frontend
 npm install
 npm run dev
 ```
 
-Open the Vite URL shown in the terminal. The frontend expects the API at
-`http://localhost:8000`; set `VITE_API_URL` if you host the API elsewhere.
+Open the Vite URL shown in the terminal. The frontend defaults to `http://localhost:8000` for the API. Set `VITE_API_URL` to the backend origin when hosted elsewhere.
 
 ## Deploy
-- Deploy `backend/` as a Python web service with start command:
-  `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- Deploy `frontend/` as a static Vite site with build command `npm run build`
-  and output directory `dist`.
-- Set `VITE_API_URL` to your deployed backend URL.
-- Set `OPENAI_API_KEY` only on the backend if you want AI explanations.
-- Configure CORS in `backend/main.py` to your deployed frontend domain before production.
+
+### Backend on Render
+
+Create a Python web service connected to this repository:
+
+- Runtime: Python
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Python version: 3.11 (the `.python-version` file pins 3.11.11)
+- Add `FRONTEND_ORIGINS` with your deployed frontend origin after the frontend is live.
+- Optionally add `OPENAI_API_KEY` and `OPENAI_MODEL`.
+
+### Frontend on Vercel
+
+Import this same repository as a Vite project:
+
+- Framework preset: Vite
+- Root directory: `.`
+- Build command: `npm run build`
+- Output directory: `dist`
+- Add `VITE_API_URL` as the public origin of the deployed Render backend (for example, `https://your-service.onrender.com`).
+
+After deployment, check `/api/health` on the backend and run a scan in the frontend. The Render CORS allowlist must include the exact Vercel production domain (and any preview domains you intend to use).
 
 ## API
-- `GET /api/health`
-- `GET /api/scan?symbol=BTCUSDT&timeframe=1h&balance=1000&risk_pct=1`
-- `GET /api/market?symbol=BTCUSDT&timeframe=1h`
-- `GET /api/universe`
 
-All prices are quoted in USDT. The default universe is configurable in `backend/main.py`.
+- `GET /api/health`
+- `GET /api/universe`
+- `GET /api/market?symbol=BTCUSDT&timeframe=1h`
+- `GET /api/scan?symbol=BTCUSDT&timeframe=1h&balance=1000&risk_pct=1`
+- `GET /api/scan/universe?balance=1000&risk_pct=1`
+
+## Risk and limitations
+
+This is a research and paper-trading aid, **not financial advice** and not a promise of profitable trades. Indicator agreement is a heuristic score, not a calibrated probability of success. Signals can fail, market data can be delayed or unavailable, and slippage, fees, liquidity and exchange minimums are not fully modeled.
+
+Position size is an estimate based on the entered account balance and risk percentage. It does not know your actual wallet balance. A BUY estimate is capped by the entered spot balance; a SELL result represents bearish bias for spot traders and is not an instruction or mechanism to open a short position. Always independently verify a setup and paper trade before risking funds.
