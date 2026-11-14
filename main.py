@@ -43,28 +43,54 @@ def validate_market(symbol: str, timeframe: str) -> tuple[str, str]:
 
 
 async def get_klines(client: httpx.AsyncClient, symbol: str, interval: str, limit: int = 250):
-    response = await client.get(
-        f"{BINANCE}/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-    )
-    response.raise_for_status()
-    raw = response.json()
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("The exchange returned no candle data.")
-
+    # Binance's primary hostname can be unreachable or geo-restricted from some
+    # cloud regions. Try the public market-data mirror and alternate API hosts.
+    configured = BINANCE.rstrip("/")
+    hosts = list(dict.fromkeys([
+        configured,
+        "https://data-api.binance.vision",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+        "https://api4.binance.com",
+    ]))
     columns = ["open_time", "open", "high", "low", "close", "volume", "close_time",
                "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
-    frame = pd.DataFrame(raw, columns=columns)
-    for column in ["open", "high", "low", "close", "volume"]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
-    frame["close_time"] = pd.to_numeric(frame["close_time"], errors="coerce")
-    frame = frame.dropna(subset=["open", "high", "low", "close", "volume", "close_time"])
+    failures = []
 
-    # Exclude the still-forming candle so signals use closed-candle data only.
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    frame = frame.loc[frame["close_time"] < now_ms].reset_index(drop=True)
-    return frame
+    for host in hosts:
+        try:
+            response = await client.get(
+                f"{host}/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=12.0,
+            )
+            response.raise_for_status()
+            raw = response.json()
+            if not isinstance(raw, list) or not raw:
+                raise ValueError("The exchange returned an empty candle response.")
+
+            frame = pd.DataFrame(raw, columns=columns)
+            for column in ["open", "high", "low", "close", "volume"]:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+            frame["close_time"] = pd.to_numeric(frame["close_time"], errors="coerce")
+            frame = frame.dropna(subset=["open", "high", "low", "close", "volume", "close_time"])
+
+            # Exclude the still-forming candle so signals use closed-candle data only.
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            frame = frame.loc[frame["close_time"] < now_ms].reset_index(drop=True)
+            if frame.empty:
+                raise ValueError("No completed candles were returned.")
+            return frame
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            failures.append(f"{host} ({status or type(exc).__name__})")
+
+    raise ValueError(
+        "Binance market data is unreachable from the backend. Tried primary, "
+        "data-api mirror and alternate hosts: " + "; ".join(failures)
+    )
 
 
 def enrich(frame: pd.DataFrame) -> pd.DataFrame:
