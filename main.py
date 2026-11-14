@@ -1,189 +1,353 @@
+import asyncio
 import os
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any
+
 import httpx
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="AI Crypto Signal Pro", version="1.0.0")
-origins = [os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")]
-app.add_middleware(
-    CORSMiddleware, allow_origins=origins, allow_credentials=False,
-    allow_methods=["GET"], allow_headers=["*"]
-)
 
-BINANCE = "https://api.binance.com"
+APP_VERSION = "1.1.0"
+BINANCE = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 UNIVERSE = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
             "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT"]
 INTERVALS = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
-async def get_klines(symbol: str, interval: str, limit: int = 250):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{BINANCE}/api/v3/klines",
-                             params={"symbol": symbol.upper(), "interval": interval, "limit": limit})
-        r.raise_for_status()
-        raw = r.json()
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
-    df = pd.DataFrame(raw, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df
+app = FastAPI(title="AI Crypto Signal Pro", version=APP_VERSION)
+allowed_origins = [
+    item.strip() for item in os.getenv(
+        "FRONTEND_ORIGINS", os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+    ).split(",") if item.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
-def enrich(df):
-    d = df.copy()
-    close = d.close
-    d["ema20"] = close.ewm(span=20, adjust=False).mean()
-    d["ema50"] = close.ewm(span=50, adjust=False).mean()
-    d["ema200"] = close.ewm(span=200, adjust=False).mean()
+
+def validate_market(symbol: str, timeframe: str) -> tuple[str, str]:
+    symbol = symbol.upper().strip()
+    if symbol not in UNIVERSE:
+        raise HTTPException(400, f"Unsupported symbol. Choose one of: {', '.join(UNIVERSE)}")
+    if timeframe not in INTERVALS:
+        raise HTTPException(400, f"Unsupported timeframe. Choose one of: {', '.join(INTERVALS)}")
+    return symbol, timeframe
+
+
+async def get_klines(client: httpx.AsyncClient, symbol: str, interval: str, limit: int = 250):
+    response = await client.get(
+        f"{BINANCE}/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    response.raise_for_status()
+    raw = response.json()
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("The exchange returned no candle data.")
+
+    columns = ["open_time", "open", "high", "low", "close", "volume", "close_time",
+               "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
+    frame = pd.DataFrame(raw, columns=columns)
+    for column in ["open", "high", "low", "close", "volume"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+    frame["close_time"] = pd.to_numeric(frame["close_time"], errors="coerce")
+    frame = frame.dropna(subset=["open", "high", "low", "close", "volume", "close_time"])
+
+    # Exclude the still-forming candle so signals use closed-candle data only.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    frame = frame.loc[frame["close_time"] < now_ms].reset_index(drop=True)
+    return frame
+
+
+def enrich(frame: pd.DataFrame) -> pd.DataFrame:
+    data = frame.copy()
+    close = data["close"]
+
+    data["ema20"] = close.ewm(span=20, adjust=False).mean()
+    data["ema50"] = close.ewm(span=50, adjust=False).mean()
+    data["ema200"] = close.ewm(span=200, adjust=False).mean()
+
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    d["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
-    fast = close.ewm(span=12, adjust=False).mean()
-    slow = close.ewm(span=26, adjust=False).mean()
-    d["macd"] = fast - slow
-    d["macd_signal"] = d.macd.ewm(span=9, adjust=False).mean()
-    d["macd_hist"] = d.macd - d.macd_signal
-    mid = close.rolling(20).mean()
-    std = close.rolling(20).std()
-    d["bb_upper"] = mid + 2 * std
-    d["bb_lower"] = mid - 2 * std
-    prev = d.close.shift(1)
-    tr = pd.concat([(d.high-d.low), (d.high-prev).abs(), (d.low-prev).abs()], axis=1).max(axis=1)
-    d["atr"] = tr.rolling(14).mean()
-    d["vol_avg"] = d.volume.rolling(20).mean()
-    return d
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    avg_loss = losses.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    relative_strength = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + relative_strength))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50)
+    data["rsi"] = rsi
 
-def build_signal(d, symbol, timeframe, balance, risk_pct):
-    x = d.iloc[-1]
-    price = float(x.close)
+    macd_fast = close.ewm(span=12, adjust=False).mean()
+    macd_slow = close.ewm(span=26, adjust=False).mean()
+    data["macd"] = macd_fast - macd_slow
+    data["macd_signal"] = data["macd"].ewm(span=9, adjust=False).mean()
+    data["macd_hist"] = data["macd"] - data["macd_signal"]
+
+    middle = close.rolling(20).mean()
+    deviation = close.rolling(20).std()
+    data["bb_middle"] = middle
+    data["bb_upper"] = middle + 2 * deviation
+    data["bb_lower"] = middle - 2 * deviation
+    data["bb_width_pct"] = ((data["bb_upper"] - data["bb_lower"]) / middle) * 100
+
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [(data["high"] - data["low"]),
+         (data["high"] - previous_close).abs(),
+         (data["low"] - previous_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    data["atr"] = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    data["vol_avg"] = data["volume"].rolling(20).mean()
+    return data
+
+
+def build_signal(data: pd.DataFrame, symbol: str, timeframe: str,
+                 balance: float, risk_pct: float) -> dict[str, Any]:
+    if len(data) < 205:
+        raise ValueError("Not enough completed candle history for EMA200. Try again later.")
+
+    latest = data.iloc[-1]
+    previous = data.iloc[-2]
+    price = float(latest["close"])
     score = 0
-    reasons = []
-    if x.close > x.ema20 > x.ema50:
-        score += 2; reasons.append("Price is above EMA20 and EMA50 (short-term bullish structure).")
-    elif x.close < x.ema20 < x.ema50:
-        score -= 2; reasons.append("Price is below EMA20 and EMA50 (short-term bearish structure).")
-    else:
-        reasons.append("Price/EMA20/EMA50 structure is mixed.")
-    if x.close > x.ema200:
-        score += 1; reasons.append("Price is above EMA200.")
-    else:
-        score -= 1; reasons.append("Price is below EMA200.")
-    if x.macd > x.macd_signal:
-        score += 1; reasons.append("MACD is above its signal line.")
-    else:
-        score -= 1; reasons.append("MACD is below its signal line.")
-    if 50 <= x.rsi <= 68:
-        score += 1; reasons.append("RSI shows positive momentum without being deeply overbought.")
-    elif x.rsi < 35:
-        score += 1; reasons.append("RSI is oversold; a reversal is possible but needs confirmation.")
-    elif x.rsi > 72:
-        score -= 1; reasons.append("RSI is elevated; chasing a long entry carries risk.")
-    else:
-        reasons.append("RSI momentum is neutral or weak.")
-    vol_ratio = float(x.volume / x.vol_avg) if pd.notna(x.vol_avg) and x.vol_avg else 1.0
-    if vol_ratio >= 1.25:
-        score += 1 if x.close >= d.close.iloc[-2] else -1
-        reasons.append(f"Volume is elevated at {vol_ratio:.2f}x its 20-candle average.")
-    else:
-        reasons.append(f"Volume is below the confirmation threshold ({vol_ratio:.2f}x average).")
+    reasons: list[str] = []
 
-    # Use recent completed candles for local levels; exclude current candle.
-    recent = d.iloc[-21:-1]
-    support = float(recent.low.min())
-    resistance = float(recent.high.max())
-    atr = float(x.atr) if pd.notna(x.atr) and x.atr > 0 else price * 0.01
+    if latest["close"] > latest["ema20"] > latest["ema50"]:
+        score += 2
+        reasons.append("Price is above EMA20 and EMA50: short-term structure is bullish.")
+    elif latest["close"] < latest["ema20"] < latest["ema50"]:
+        score -= 2
+        reasons.append("Price is below EMA20 and EMA50: short-term structure is bearish.")
+    else:
+        reasons.append("Price, EMA20 and EMA50 are not aligned.")
+
+    if latest["close"] > latest["ema200"]:
+        score += 1
+        reasons.append("Price is above EMA200, supporting the broader trend.")
+    else:
+        score -= 1
+        reasons.append("Price is below EMA200, weakening the broader trend.")
+
+    if latest["macd"] > latest["macd_signal"]:
+        score += 1
+        reasons.append("MACD is above its signal line.")
+    else:
+        score -= 1
+        reasons.append("MACD is below its signal line.")
+
+    rsi = float(latest["rsi"])
+    if 50 <= rsi <= 68:
+        score += 1
+        reasons.append("RSI momentum is positive without being extremely overbought.")
+    elif rsi < 30:
+        score += 1
+        reasons.append("RSI is oversold; a bounce is possible but needs price confirmation.")
+    elif rsi > 72:
+        score -= 1
+        reasons.append("RSI is elevated; chasing a long entry is risky.")
+    else:
+        reasons.append("RSI is neutral or does not strongly confirm direction.")
+
+    volume_average = float(latest["vol_avg"]) if pd.notna(latest["vol_avg"]) else 0.0
+    volume_ratio = float(latest["volume"] / volume_average) if volume_average > 0 else 0.0
+    if volume_ratio >= 1.25:
+        score += 1 if latest["close"] >= previous["close"] else -1
+        reasons.append(f"Volume is elevated at {volume_ratio:.2f}x its 20-candle average.")
+    else:
+        reasons.append(f"Volume confirmation is limited ({volume_ratio:.2f}x its 20-candle average).")
+
+    recent = data.iloc[-21:-1]
+    support = float(recent["low"].min())
+    resistance = float(recent["high"].max())
+    atr = float(latest["atr"]) if pd.notna(latest["atr"]) and latest["atr"] > 0 else price * 0.01
 
     if score >= 3:
         action = "BUY"
-        entry_low, entry_high = price - atr*0.20, price + atr*0.10
-        stop = min(price - atr*1.5, support - atr*0.15)
-        risk_per_unit = max(price-stop, atr*0.5)
-        tp1, tp2 = price + risk_per_unit*1.5, price + risk_per_unit*2.5
+        entry_low, entry_high = price - atr * 0.20, price + atr * 0.10
+        stop = min(price - atr * 1.5, support - atr * 0.15)
+        risk_per_unit = max(price - stop, atr * 0.5)
+        target1, target2 = price + risk_per_unit * 1.5, price + risk_per_unit * 2.5
     elif score <= -3:
         action = "SELL"
-        entry_low, entry_high = price - atr*0.10, price + atr*0.20
-        stop = max(price + atr*1.5, resistance + atr*0.15)
-        risk_per_unit = max(stop-price, atr*0.5)
-        tp1, tp2 = price - risk_per_unit*1.5, price - risk_per_unit*2.5
+        entry_low, entry_high = price - atr * 0.10, price + atr * 0.20
+        stop = max(price + atr * 1.5, resistance + atr * 0.15)
+        risk_per_unit = max(stop - price, atr * 0.5)
+        target1, target2 = price - risk_per_unit * 1.5, price - risk_per_unit * 2.5
     else:
         action = "HOLD"
-        entry_low = entry_high = stop = tp1 = tp2 = None
+        entry_low = entry_high = stop = target1 = target2 = None
         risk_per_unit = None
 
-    confidence = int(min(92, 50 + abs(score)*8 + (5 if vol_ratio >= 1.25 else 0)))
-    risk_cash = max(0, float(balance) * max(0, float(risk_pct))/100)
-    size = (risk_cash / risk_per_unit) if risk_per_unit and risk_per_unit > 0 else 0
+    confidence = int(min(92, 50 + abs(score) * 8 + (5 if volume_ratio >= 1.25 else 0)))
+    risk_cash = float(balance) * float(risk_pct) / 100
+    position_size = risk_cash / risk_per_unit if risk_per_unit and risk_per_unit > 0 else 0.0
+    # A spot BUY cannot exceed the cash balance supplied by the user.
+    if action == "BUY" and price > 0:
+        position_size = min(position_size, float(balance) / price)
+
     return {
-        "symbol": symbol, "timeframe": timeframe, "action": action,
-        "confidence": confidence, "score": score, "price": price,
-        "entry_low": entry_low, "entry_high": entry_high, "stop_loss": stop,
-        "take_profit_1": tp1, "take_profit_2": tp2,
-        "support": support, "resistance": resistance, "rsi": float(x.rsi),
-        "macd": float(x.macd), "macd_signal": float(x.macd_signal),
-        "ema20": float(x.ema20), "ema50": float(x.ema50), "ema200": float(x.ema200),
-        "volume_ratio": vol_ratio, "atr": atr, "risk_amount": risk_cash,
-        "position_size_base": size, "reasons": reasons,
-        "disclaimer": "Rule-based technical setup, not a prediction or guaranteed trade. Confirm before entering."
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "action": action,
+        "confidence": confidence,
+        "score": int(score),
+        "price": price,
+        "entry_low": float(entry_low) if entry_low is not None else None,
+        "entry_high": float(entry_high) if entry_high is not None else None,
+        "stop_loss": float(stop) if stop is not None else None,
+        "take_profit_1": float(target1) if target1 is not None else None,
+        "take_profit_2": float(target2) if target2 is not None else None,
+        "support": support,
+        "resistance": resistance,
+        "rsi": rsi,
+        "macd": float(latest["macd"]),
+        "macd_signal": float(latest["macd_signal"]),
+        "macd_hist": float(latest["macd_hist"]),
+        "ema20": float(latest["ema20"]),
+        "ema50": float(latest["ema50"]),
+        "ema200": float(latest["ema200"]),
+        "bb_upper": float(latest["bb_upper"]),
+        "bb_middle": float(latest["bb_middle"]),
+        "bb_lower": float(latest["bb_lower"]),
+        "bb_width_pct": float(latest["bb_width_pct"]),
+        "volume_ratio": volume_ratio,
+        "atr": atr,
+        "atr_pct": atr / price * 100 if price else 0,
+        "risk_amount": risk_cash,
+        "position_size_base": float(position_size),
+        "risk_reward_1": 1.5 if action != "HOLD" else None,
+        "risk_reward_2": 2.5 if action != "HOLD" else None,
+        "reasons": reasons,
+        "data_as_of": data.iloc[-1]["open_time"].isoformat(),
+        "disclaimer": (
+            "Rule-based technical analysis using closed candles, not a prediction or guarantee. "
+            "SELL indicates bearish bias for spot traders; this app does not execute or open short positions."
+        ),
     }
+
+
+async def scan_one(client: httpx.AsyncClient, symbol: str, timeframe: str,
+                   balance: float, risk_pct: float) -> dict[str, Any]:
+    candles = await get_klines(client, symbol, timeframe, 250)
+    indicators = enrich(candles).dropna(subset=[
+        "ema200", "rsi", "macd", "macd_signal", "atr", "vol_avg",
+        "bb_upper", "bb_lower",
+    ])
+    return build_signal(indicators, symbol, timeframe, balance, risk_pct)
+
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "AI Crypto Signal Pro"}
+    return {"status": "ok", "service": "AI Crypto Signal Pro", "version": APP_VERSION}
+
 
 @app.get("/api/universe")
 async def universe():
     return {"symbols": UNIVERSE, "timeframes": list(INTERVALS.keys())}
 
+
 @app.get("/api/market")
 async def market(symbol: str = "BTCUSDT", timeframe: str = "1h"):
-    symbol = symbol.upper()
-    if timeframe not in INTERVALS:
-        raise HTTPException(400, "Unsupported timeframe")
+    symbol, timeframe = validate_market(symbol, timeframe)
     try:
-        df = await get_klines(symbol, timeframe, 120)
-        return {"symbol": symbol, "timeframe": timeframe,
-                "candles": [{"time": int(row.open_time.timestamp()), "open": row.open,
-                             "high": row.high, "low": row.low, "close": row.close,
-                             "volume": row.volume} for row in df.tail(100).itertuples()]}
-    except Exception as e:
-        raise HTTPException(502, f"Market data unavailable: {str(e)}")
+        async with httpx.AsyncClient(timeout=15) as client:
+            candles = await get_klines(client, symbol, timeframe, 120)
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles": [
+                {
+                    "time": int(row.open_time.timestamp()),
+                    "open": float(row.open),
+                    "high": float(row.high),
+                    "low": float(row.low),
+                    "close": float(row.close),
+                    "volume": float(row.volume),
+                }
+                for row in candles.tail(100).itertuples()
+            ],
+        }
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(502, f"Binance returned HTTP {exc.response.status_code}.") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, f"Market data unavailable: {exc}") from exc
+
 
 @app.get("/api/scan")
-async def scan(symbol: str = "BTCUSDT", timeframe: str = "1h",
-               balance: float = Query(1000, ge=0),
-               risk_pct: float = Query(1, ge=0, le=5)):
-    symbol = symbol.upper()
-    if timeframe not in INTERVALS:
-        raise HTTPException(400, "Unsupported timeframe")
+async def scan(
+    symbol: str = "BTCUSDT",
+    timeframe: str = "1h",
+    balance: float = Query(1000, ge=0),
+    risk_pct: float = Query(1, ge=0, le=5),
+):
+    symbol, timeframe = validate_market(symbol, timeframe)
     try:
-        df = enrich(await get_klines(symbol, timeframe, 250)).dropna()
-        if len(df) < 30:
-            raise ValueError("Not enough candle history to calculate indicators")
-        result = build_signal(df, symbol, timeframe, balance, risk_pct)
-        key = os.getenv("OPENAI_API_KEY")
-        if key:
+        async with httpx.AsyncClient(timeout=20) as client:
+            result = await scan_one(client, symbol, timeframe, balance, risk_pct)
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
             try:
-                from openai import OpenAI
-                client = OpenAI(api_key=key)
-                prompt = ("Explain this technical signal in plain language. Do not change the action, "
-                          "levels, confidence or invent data. Mention uncertainty and invalidation. "
-                          f"Signal JSON: {result}")
-                response = client.chat.completions.create(
+                from openai import AsyncOpenAI
+                ai_client = AsyncOpenAI(api_key=api_key)
+                response = await ai_client.chat.completions.create(
                     model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                    messages=[{"role":"user","content":prompt}], temperature=0.2, max_tokens=220
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Explain this technical analysis in plain language. Do not change the "
+                            "action, levels, confidence or invent data. State uncertainty and what "
+                            f"would invalidate the setup. Data: {result}"
+                        ),
+                    }],
+                    temperature=0.2,
+                    max_tokens=220,
                 )
                 result["ai_explanation"] = response.choices[0].message.content
             except Exception:
-                result["ai_explanation"] = "AI explanation unavailable; see the indicator reasons."
+                result["ai_explanation"] = "AI explanation is temporarily unavailable; use the indicator reasons."
         return result
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Exchange returned an error: {e.response.status_code}")
-    except Exception as e:
-        raise HTTPException(502, f"Could not generate signal: {str(e)}")
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(502, f"Binance returned HTTP {exc.response.status_code}.") from exc
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise HTTPException(502, f"Could not generate signal: {exc}") from exc
+
+
+@app.get("/api/scan/universe")
+async def scan_universe(
+    balance: float = Query(1000, ge=0),
+    risk_pct: float = Query(1, ge=0, le=5),
+):
+    # Limit concurrency to be polite to the public exchange API.
+    semaphore = asyncio.Semaphore(5)
+    async with httpx.AsyncClient(timeout=20) as client:
+        async def guarded(symbol: str, timeframe: str):
+            async with semaphore:
+                try:
+                    return await scan_one(client, symbol, timeframe, balance, risk_pct)
+                except Exception as exc:
+                    return {"symbol": symbol, "timeframe": timeframe, "action": "ERROR",
+                            "error": str(exc)}
+
+        results = await asyncio.gather(
+            *(guarded(symbol, timeframe) for symbol in UNIVERSE for timeframe in ("15m", "1h", "4h"))
+        )
+    return {
+        "scanned": len(results),
+        "successful": sum(1 for item in results if item["action"] != "ERROR"),
+        "results": results,
+        "disclaimer": "Market-wide technical scan only. Confirm setups independently; no trades are placed.",
+    }
